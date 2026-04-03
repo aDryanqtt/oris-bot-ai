@@ -1,0 +1,64 @@
+Meu tutorial para o bot:
+
+Porque aparentemente ler instrução básica sozinho era difícil, então aqui vai o passo a passo do bot, bem mastigado.
+
+ORIS BOT - TUTORIAL DE INSTALACAO E USO
+
+Este pacote ja contem as credenciais configuradas no arquivo .env.
+
+O que instalar no outro PC:
+1. Python 3.11 ou 3.12
+2. Git opcional
+3. Ollama opcional, apenas se quiser fallback local no futuro
+
+Passo a passo:
+1. Extraia o .zip para uma pasta, por exemplo:
+   C:\OrisBot
+
+2. Abra o Prompt de Comando ou PowerShell dentro da pasta extraida.
+
+3. Crie o ambiente virtual:
+   python -m venv .venv
+
+4. Ative o ambiente virtual:
+   PowerShell:
+   .\.venv\Scripts\Activate.ps1
+
+   CMD:
+   .\.venv\Scripts\activate.bat
+
+5. Instale as dependencias:
+   pip install -r requirements.txt
+
+6. Inicie o bot:
+   python bot.py
+
+Observacoes importantes:
+- O bot esta configurado para usar Mistral como provedor principal.
+- O arquivo .env ja inclui DISCORD_TOKEN e MISTRAL_API_KEY.
+- O modelo de vision esta configurado como:
+  MISTRAL_VISION_MODEL=mistral-large-2512
+- Se o outro PC nao tiver Ollama, o bot ainda deve funcionar para texto e vision via Mistral.
+- A pasta data contem o banco SQLite local do projeto.
+
+Arquivos principais:
+- bot.py: arquivo principal do bot
+- .env: credenciais e configuracoes
+- requirements.txt: dependencias Python
+- INICIAR_BOT.bat: inicializacao rapida no Windows
+
+Inicializacao rapida no Windows:
+1. Abra a pasta extraida
+2. Dê duplo clique em INICIAR_BOT.bat
+
+Se o Windows bloquear a execucao do PowerShell:
+- Abra PowerShell como administrador e rode:
+  Set-ExecutionPolicy RemoteSigned
+
+Se der erro de modulo faltando:
+- Ative o ambiente virtual e rode novamente:
+  pip install -r requirements.txt
+
+Se quiser trocar modelos:
+- Edite o arquivo .env
+- Depois reinicie o bot
