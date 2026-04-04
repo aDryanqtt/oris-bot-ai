@@ -45,6 +45,7 @@ bot = commands.Bot(
 
 COGS = [
     "cogs.chat",
+    "cogs.knowledge_manager",
     "cogs.aws_tools",
     "cogs.code_tools",
     "cogs.cloud_gaming",
@@ -115,6 +116,7 @@ COG_EMOJI_MAP = {
     "Code Tools": "wPy",
     "Utilitarios": "wFix2",
     "Tickets": "wTicket",
+    "Knowledge": "wPy",
     "Moderacao": "wShield",
     "Perfil": "wUser",
     "Economia": "wCash",

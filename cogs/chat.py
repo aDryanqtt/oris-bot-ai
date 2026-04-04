@@ -11,6 +11,7 @@ import base64
 import aiohttp
 
 from utils.ollama_client import ollama
+from utils.admin_knowledge import format_admin_knowledge_context, get_relevant_admin_knowledge
 from utils.helpers import split_message, extract_urls, fetch_url_content
 from utils.database import db
 from utils.ticketing import OWNER_ID, STAFF_ROLE_ID, is_staff_member
@@ -178,7 +179,13 @@ class ChatCog(commands.Cog, name="💬 Chat"):
         instructions.append("=== FIM DA CLASSIFICACAO DE INTENCAO ===]")
         return "\n".join(instructions)
 
-    def _build_context(self, user_name: str, channel: discord.abc.GuildChannel, roles_text: str = "") -> str:
+    def _build_context(
+        self,
+        user_name: str,
+        channel: discord.abc.GuildChannel,
+        roles_text: str = "",
+        query: str = "",
+    ) -> str:
         hora = now_br()
         saudacao = get_greeting()
         ctx_str = (
@@ -192,6 +199,13 @@ class ChatCog(commands.Cog, name="💬 Chat"):
             f"Explicações completas: MÁXIMO ABSOLUTO de 3 parágrafos curtos. "
             f"EXCEÇÃO: Se o usuário pedir para analisar, criar ou otimizar CÓDIGO de programação, ignore o limite de tamanho e forneça o código completo formatado perfeitamente com crases triplas (```linguagem). "
             f"NÃO vomite toneladas de informações. Entregue apenas o que o usuário pediu.]"
+        )
+
+        ctx_str += (
+            "\n[PRIORIDADE DE VERDADE: 1) base oficial da Oris Cloud, "
+            "2) conhecimento aprovado por admins, 3) contexto relevante de canais publicos. "
+            "Se a resposta nao estiver sustentada por essas fontes ou pela mensagem atual, "
+            "diga claramente que nao sabe e sugira ticket ou equipe humana.]"
         )
 
         import os
@@ -229,7 +243,7 @@ class ChatCog(commands.Cog, name="💬 Chat"):
             guild_id = getattr(channel, 'guild', None)
             guild_id = guild_id.id if guild_id else None
             if guild_id:
-                canal_ctx = channel_knowledge.get_context(guild_id)
+                canal_ctx = channel_knowledge.get_relevant_context(guild_id, query) if query else channel_knowledge.get_context(guild_id)
                 if canal_ctx:
                     ctx_str += (
                         f"\n\n[=== CONTEXTO DO SERVIDOR (canais públicos) ===\n"
@@ -400,6 +414,22 @@ class ChatCog(commands.Cog, name="💬 Chat"):
                     ticket_intent["next_step"],
                 )
 
+        approved_knowledge_entries = []
+        guild = getattr(channel, "guild", None)
+        if guild and content.strip():
+            approved_knowledge_entries = await get_relevant_admin_knowledge(
+                guild.id,
+                content,
+                is_ticket=self._is_ticket_channel(channel),
+                limit=4,
+            )
+            if approved_knowledge_entries:
+                logger.info(
+                    "Conhecimento aprovado usado no canal %s: entradas=%s",
+                    channel.id,
+                    ", ".join(str(entry["id"]) for entry in approved_knowledge_entries),
+                )
+
         final_content = content or "[imagem enviada]"
         if url_context:
             final_content += f"\n\n[O usuário compartilhou links. Aqui está o conteúdo extraído para sua análise:]{url_context}"
@@ -407,8 +437,11 @@ class ChatCog(commands.Cog, name="💬 Chat"):
         if web_context:
             final_content += web_context
 
-        context_info = self._build_context(user_name, channel, roles_text)
+        context_info = self._build_context(user_name, channel, roles_text, content)
         enriched_content = final_content + context_info
+        approved_knowledge_context = format_admin_knowledge_context(approved_knowledge_entries)
+        if approved_knowledge_context:
+            enriched_content += "\n\n" + approved_knowledge_context
         ticket_intent_context = self._build_ticket_intent_context(ticket_intent)
         if ticket_intent_context:
             enriched_content += "\n\n" + ticket_intent_context

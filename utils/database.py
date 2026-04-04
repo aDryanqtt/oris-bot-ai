@@ -157,6 +157,21 @@ class Database:
                 added_at TEXT NOT NULL
             );
 
+            -- Conhecimento aprovado manualmente por administradores
+            CREATE TABLE IF NOT EXISTS admin_knowledge (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'both'
+                    CHECK(scope IN ('public', 'ticket', 'both')),
+                trigger_text TEXT NOT NULL,
+                answer_text TEXT NOT NULL,
+                tags TEXT DEFAULT '',
+                created_by INTEGER NOT NULL,
+                source_channel_id INTEGER,
+                source_message_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
             -- Índices para performance
             CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
             CREATE INDEX IF NOT EXISTS idx_conversations_user_channel ON conversations(user_id, channel_id);
@@ -165,6 +180,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_reminders_completed ON reminders(completed);
             CREATE INDEX IF NOT EXISTS idx_command_logs_user ON command_logs(user_id);
             CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_admin_knowledge_guild_scope ON admin_knowledge(guild_id, scope);
         """)
         await self._db.commit()
 
@@ -840,6 +856,119 @@ class Database:
             "SELECT DISTINCT guild_id FROM scan_channels"
         )
         return [row[0] for row in await cursor.fetchall()]
+
+    # ==================== CONHECIMENTO APROVADO POR ADMINS ====================
+
+    async def add_admin_knowledge(
+        self,
+        guild_id: int,
+        scope: str,
+        trigger_text: str,
+        answer_text: str,
+        created_by: int,
+        tags: str = "",
+        source_channel_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> int:
+        """Salva uma entrada de conhecimento aprovada por admins."""
+        async with self._lock:
+            from config import now_br
+
+            cursor = await self._db.execute(
+                """
+                INSERT INTO admin_knowledge (
+                    guild_id, scope, trigger_text, answer_text, tags,
+                    created_by, source_channel_id, source_message_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    scope,
+                    trigger_text[:1200],
+                    answer_text[:2500],
+                    tags[:400],
+                    created_by,
+                    source_channel_id,
+                    source_message_id,
+                    now_br().isoformat(),
+                ),
+            )
+            await self._db.commit()
+            return cursor.lastrowid
+
+    async def remove_admin_knowledge(self, entry_id: int, guild_id: int) -> bool:
+        """Remove uma entrada de conhecimento aprovada."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "DELETE FROM admin_knowledge WHERE id = ? AND guild_id = ?",
+                (entry_id, guild_id),
+            )
+            await self._db.commit()
+            return cursor.rowcount > 0
+
+    async def list_admin_knowledge(
+        self,
+        guild_id: int,
+        limit: int = 20,
+        scope: str | None = None,
+    ) -> list:
+        """Lista entradas salvas de conhecimento aprovado."""
+        limit = max(1, min(limit, 50))
+
+        if scope in {"public", "ticket", "both"}:
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM admin_knowledge
+                WHERE guild_id = ? AND scope = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, scope, limit),
+            )
+        else:
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM admin_knowledge
+                WHERE guild_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            )
+
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_admin_knowledge_entries(self, guild_id: int, scope: str | None = None) -> list:
+        """Busca entradas de conhecimento elegiveis para um contexto."""
+        if scope in {"public", "ticket"}:
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM admin_knowledge
+                WHERE guild_id = ? AND scope IN (?, 'both')
+                ORDER BY id DESC
+                """,
+                (guild_id, scope),
+            )
+        elif scope == "both":
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM admin_knowledge
+                WHERE guild_id = ?
+                ORDER BY id DESC
+                """,
+                (guild_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM admin_knowledge
+                WHERE guild_id = ?
+                ORDER BY id DESC
+                """,
+                (guild_id,),
+            )
+
+        return [dict(row) for row in await cursor.fetchall()]
 
 
 # Instância global
