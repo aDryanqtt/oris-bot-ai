@@ -13,6 +13,9 @@ import aiohttp
 from utils.ollama_client import ollama
 from utils.helpers import split_message, extract_urls, fetch_url_content
 from utils.database import db
+from utils.ticketing import OWNER_ID, STAFF_ROLE_ID, is_staff_member
+from utils.ticketing import is_ticket_channel as shared_is_ticket_channel
+from utils.ticketing import is_ticket_routing_channel as shared_is_ticket_routing_channel
 from utils.web_search import search_web
 from utils import channel_knowledge
 from config import MAX_HISTORY, PERSONAS, now_br, get_greeting, format_datetime_br
@@ -21,6 +24,24 @@ from utils.containers import container, section, text_display, send_components, 
 logger = logging.getLogger(__name__)
 
 user_personas = defaultdict(lambda: "padrao")
+
+TICKET_INTENT_PROMPT = """Voce classifica mensagens de tickets da Oris Cloud.
+Analise a intencao principal do cliente e retorne EXATAMENTE 3 linhas:
+INTENT: plano_recomendado | comparacao_planos | revenda | compra_fechamento | suporte_tecnico | outro
+CONFIDENCE: HIGH | MEDIUM | LOW
+NEXT_STEP: responder | sugerir_ticket_humano | chamar_staff
+
+Regras:
+- plano_recomendado: usuario quer saber qual plano faz mais sentido para o uso dele.
+- comparacao_planos: usuario compara duracao, custo-beneficio, adicionais ou opcoes.
+- revenda: usuario fala de revenda, tabela de revenda, margem ou valores para revender.
+- compra_fechamento: usuario quer comprar, gerar PIX, pagar, aprovar pagamento, liberar maquina ou entregar acesso.
+- suporte_tecnico: problema tecnico, erro, lag, instabilidade, falha de uso.
+- outro: tudo que nao se encaixa.
+- NEXT_STEP deve ser chamar_staff para compra_fechamento.
+- NEXT_STEP pode ser sugerir_ticket_humano para suporte_tecnico avancado ou situacao pouco clara.
+- Se estiver em duvida entre responder e escalar, prefira responder.
+"""
 
 
 async def send_msg(bot, channel_id, title, msg, is_error=False, icon=None, fallback="", ping=None):
@@ -39,6 +60,123 @@ class ChatCog(commands.Cog, name="💬 Chat"):
 
     async def _get_history(self, user_id: int, channel_id: int) -> list:
         return await db.get_conversation_history(user_id, channel_id, limit=MAX_HISTORY)
+
+    def _is_ticket_channel(self, channel) -> bool:
+        return shared_is_ticket_channel(channel)
+
+    def _is_ticket_routing_channel(self, channel) -> bool:
+        return shared_is_ticket_routing_channel(channel)
+
+    def _parse_ticket_intent_result(self, response: str) -> dict | None:
+        fields = {}
+        for raw_line in response.splitlines():
+            line = raw_line.strip()
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip().upper()] = value.strip()
+
+        intent = fields.get("INTENT", "").lower()
+        confidence = fields.get("CONFIDENCE", "").upper()
+        next_step = fields.get("NEXT_STEP", "").lower()
+
+        if intent not in {
+            "plano_recomendado",
+            "comparacao_planos",
+            "revenda",
+            "compra_fechamento",
+            "suporte_tecnico",
+            "outro",
+        }:
+            return None
+        if confidence not in {"HIGH", "MEDIUM", "LOW"}:
+            return None
+        if next_step not in {"responder", "sugerir_ticket_humano", "chamar_staff"}:
+            return None
+
+        return {
+            "intent": intent,
+            "confidence": confidence,
+            "next_step": next_step,
+        }
+
+    async def _classify_ticket_intent(self, content: str, channel) -> dict | None:
+        text = (content or "").strip()
+        if not text or not self._is_ticket_channel(channel):
+            return None
+
+        prompt = (
+            f"{TICKET_INTENT_PROMPT}\n\n"
+            f"Canal: #{getattr(channel, 'name', 'desconhecido')}\n"
+            f"Mensagem do cliente:\n\"\"\"\n{text[:1200]}\n\"\"\""
+        )
+        response, error = await ollama.generate_simple(prompt)
+        if error or not response:
+            logger.warning(f"Classificacao de ticket falhou: {error or 'resposta vazia'}")
+            return None
+
+        parsed = self._parse_ticket_intent_result(response)
+        if not parsed:
+            logger.warning(f"Classificacao de ticket retornou formato invalido: {response[:300]!r}")
+            return None
+
+        return parsed
+
+    def _build_ticket_intent_context(self, ticket_intent: dict | None) -> str:
+        if not ticket_intent:
+            return ""
+
+        intent = ticket_intent["intent"]
+        confidence = ticket_intent["confidence"]
+        next_step = ticket_intent["next_step"]
+
+        instructions = [
+            "[=== CLASSIFICACAO DE INTENCAO DO TICKET ===",
+            f"Intent principal detectada: {intent}",
+            f"Confianca: {confidence}",
+            f"Proximo passo preferido: {next_step}",
+            "Responda em portugues do Brasil, de forma curta, objetiva e com proximo passo claro.",
+            "Nao misture revenda com tabela de planos normais.",
+            "Nao invente preco, plano, margem, prazo ou recurso fora da base oficial.",
+        ]
+
+        if intent == "plano_recomendado":
+            instructions.extend([
+                "Entenda o uso do cliente e recomende o plano mais coerente quando houver contexto suficiente.",
+                "Se faltar um dado essencial, faca no maximo 1 pergunta objetiva.",
+                "Feche a resposta com uma recomendacao pratica.",
+            ])
+        elif intent == "comparacao_planos":
+            instructions.extend([
+                "Compare opcoes em no maximo 3 pontos curtos.",
+                "Diga qual opcao faz mais sentido no caso descrito.",
+                "Feche com uma recomendacao objetiva.",
+            ])
+        elif intent == "revenda":
+            instructions.extend([
+                "Use apenas a tabela oficial de revenda.",
+                "Se o usuario pedir valores, responda com os valores de revenda sem misturar com plano comum.",
+                "Se fizer sentido, indique qual faixa parece melhor para comecar.",
+            ])
+        elif intent == "compra_fechamento":
+            instructions.extend([
+                "O cliente ja esta em fase de compra ou liberacao.",
+                "Seja curto, confirme o proximo passo humano e inclua [CHAMAR_STAFF].",
+                "Nao tente aprovar pagamento nem liberar maquina voce mesmo.",
+            ])
+        elif intent == "suporte_tecnico":
+            instructions.extend([
+                "Se for algo simples, responda com orientacao direta.",
+                "Se parecer avancado ou depender de equipe, diga isso de forma curta.",
+            ])
+
+        if next_step == "sugerir_ticket_humano":
+            instructions.append("Sinalize de forma breve que um humano pode precisar assumir se isso nao resolver.")
+        elif next_step == "chamar_staff":
+            instructions.append("Inclua [CHAMAR_STAFF] na resposta.")
+
+        instructions.append("=== FIM DA CLASSIFICACAO DE INTENCAO ===]")
+        return "\n".join(instructions)
 
     def _build_context(self, user_name: str, channel: discord.abc.GuildChannel, roles_text: str = "") -> str:
         hora = now_br()
@@ -66,8 +204,7 @@ class ChatCog(commands.Cog, name="💬 Chat"):
             except Exception as e:
                 logger.error(f"Erro ao ler Knowledge Base: {e}")
 
-        TICKET_PREFIXES = ('ticket-', 'geral-', 'suporte-', 'revenda-', 'duvida-', 'dúvida-')
-        is_ticket = hasattr(channel, 'name') and channel.name.startswith(TICKET_PREFIXES)
+        is_ticket = self._is_ticket_channel(channel)
 
         if is_ticket:
             if kb:
@@ -251,6 +388,18 @@ class ChatCog(commands.Cog, name="💬 Chat"):
                 except Exception as e:
                     logger.error(f"❌ Pesquisa falhou e foi pulada: {e}")
 
+        ticket_intent = None
+        if self._is_ticket_channel(channel) and content.strip():
+            ticket_intent = await self._classify_ticket_intent(content, channel)
+            if ticket_intent:
+                logger.info(
+                    "Ticket %s classificado como intent=%s confidence=%s next_step=%s",
+                    channel.id,
+                    ticket_intent["intent"],
+                    ticket_intent["confidence"],
+                    ticket_intent["next_step"],
+                )
+
         final_content = content or "[imagem enviada]"
         if url_context:
             final_content += f"\n\n[O usuário compartilhou links. Aqui está o conteúdo extraído para sua análise:]{url_context}"
@@ -260,6 +409,9 @@ class ChatCog(commands.Cog, name="💬 Chat"):
 
         context_info = self._build_context(user_name, channel, roles_text)
         enriched_content = final_content + context_info
+        ticket_intent_context = self._build_ticket_intent_context(ticket_intent)
+        if ticket_intent_context:
+            enriched_content += "\n\n" + ticket_intent_context
 
         channel_id = channel.id
         await db.save_message(user_id, channel_id, "user", final_content)
@@ -279,15 +431,17 @@ class ChatCog(commands.Cog, name="💬 Chat"):
             if "[CHAMAR_STAFF]" in resposta:
                 resposta = resposta.replace("[CHAMAR_STAFF]", "").strip()
                 chamar_staff = True
+            elif ticket_intent and ticket_intent["next_step"] == "chamar_staff" and self._is_ticket_channel(channel):
+                chamar_staff = True
+                if "equipe" not in resposta.lower() and "staff" not in resposta.lower():
+                    resposta += "\n\nVou encaminhar isso para a equipe concluir seu atendimento."
 
             await db.save_message(user_id, channel_id, "assistant", resposta)
 
-            TICKET_PREFIXES = ('ticket-', 'geral-', 'suporte-', 'revenda-', 'duvida-', 'dúvida-')
-            is_ticket_channel = hasattr(channel, 'name') and channel.name.startswith(TICKET_PREFIXES)
+            is_ticket_channel = self._is_ticket_channel(channel)
 
             if chamar_staff and is_ticket_channel:
                 await db.ignore_channel(channel_id)
-                STAFF_ROLE_ID = 1483338058920103936
                 resposta += f"\n\n<@&{STAFF_ROLE_ID}> — **Uma pessoa da equipe assumirá este atendimento em breve! (A IA foi pausada).**"
                 logger.info(f"🚨 A IA decidiu transferir o canal #{channel.name} para um humano.")
             elif chamar_staff:
@@ -344,12 +498,11 @@ class ChatCog(commands.Cog, name="💬 Chat"):
 
         if message.guild:
             is_admin = getattr(message.author, 'guild_permissions', None) and message.author.guild_permissions.administrator
-            is_owner = message.author.id == 666739489502396438
+            is_owner = message.author.id == OWNER_ID
             
             if not is_admin and not is_owner:
                 bot_channel_id = await db.get_bot_channel(message.guild.id)
-                ticket_prefixes = ('ticket-', 'geral-', 'suporte-', 'revenda-', 'duvida-', 'dúvida-', '💸・compras', '🤖・oris-ai')
-                is_ticket = getattr(message.channel, 'name', '').startswith(ticket_prefixes)
+                is_ticket = self._is_ticket_routing_channel(message.channel)
                 if bot_channel_id and message.channel.id != bot_channel_id and not is_ticket:
                     return
 
@@ -361,22 +514,18 @@ class ChatCog(commands.Cog, name="💬 Chat"):
             bot_replied = message.reference and getattr(message.reference.resolved, "author", None) == self.bot.user
             role_mentioned = any(r in message.role_mentions for r in message.guild.me.roles)
             
-            ticket_prefixes = ('ticket-', 'geral-', 'suporte-', 'revenda-', 'duvida-', 'dúvida-', '💸・compras', '🤖・oris-ai')
-            is_ticket_channel = message.channel.name.startswith(ticket_prefixes) or message.channel.name == "🤖・oris-ai"
+            is_ticket_channel = self._is_ticket_routing_channel(message.channel)
             
             is_mentioned = bot_mentioned or bot_replied or role_mentioned or is_ticket_channel
 
         if not is_dm and not is_mentioned:
             return
 
-        if not is_dm and getattr(message.channel, 'name', '').startswith(('ticket-', 'geral-', 'suporte-', 'revenda-', 'duvida-', 'dúvida-', '💸・compras', '🤖・oris-ai')):
+        if not is_dm and self._is_ticket_routing_channel(message.channel):
             if await db.is_channel_ignored(message.channel.id):
                 return
 
-            STAFF_ROLE_ID = 1483338058920103936
-            has_staff = any(r.id == STAFF_ROLE_ID for r in getattr(message.author, 'roles', []))
-            
-            if has_staff or (getattr(message.author, 'guild_permissions', None) and message.author.guild_permissions.administrator):
+            if is_staff_member(message.author):
                 await db.ignore_channel(message.channel.id)
                 logger.info(f"👨‍💻 Staff assumiu o ticket #{message.channel.name}. Desligando a IA.")
                 await send_msg(self.bot, message.channel.id, "IA Desativada", "Equipe Humana conectada. A partir de agora um staff conduzirá sua solicitação isoladamente.", ping=message.author.mention)
